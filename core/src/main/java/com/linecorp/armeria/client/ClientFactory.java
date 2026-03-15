@@ -35,6 +35,7 @@ import org.slf4j.LoggerFactory;
 import com.google.common.base.Strings;
 
 import com.linecorp.armeria.client.endpoint.EndpointGroup;
+import com.linecorp.armeria.common.Flags;
 import com.linecorp.armeria.common.FlagsProvider;
 import com.linecorp.armeria.common.NonBlocking;
 import com.linecorp.armeria.common.Scheme;
@@ -45,6 +46,7 @@ import com.linecorp.armeria.common.util.Exceptions;
 import com.linecorp.armeria.common.util.ListenableAsyncCloseable;
 import com.linecorp.armeria.common.util.ReleasableHolder;
 import com.linecorp.armeria.common.util.ShutdownHooks;
+import com.linecorp.armeria.common.util.UnmodifiableFuture;
 import com.linecorp.armeria.common.util.Unwrappable;
 import com.linecorp.armeria.internal.client.ClientBuilderParamsUtil;
 
@@ -59,15 +61,16 @@ import io.netty.channel.EventLoopGroup;
  * <p>
  * {@link Clients} or {@link ClientBuilder} uses the default {@link ClientFactory} returned by
  * {@link #ofDefault()}, unless you specified a {@link ClientFactory} explicitly. Calling {@link #close()}
- * on the default {@link ClientFactory} will neither terminate its I/O threads nor release other related
- * resources unlike other {@link ClientFactory} to protect itself from accidental premature termination.
+ * on the default {@link ClientFactory} returned by {@link #ofDefault()} will neither terminate its I/O
+ * threads nor release other related resources unlike other {@link ClientFactory} to protect itself from
+ * accidental premature termination.
  * </p><p>
  * Instead, when the current {@link ClassLoader} is {@linkplain ClassLoader#getSystemClassLoader() the system
  * class loader}, a {@linkplain Runtime#addShutdownHook(Thread) shutdown hook} is registered so that they are
  * released when the JVM exits.
  * </p><p>
  * If you are in a multi-classloader environment or you desire an early/explicit termination of the default
- * {@link ClientFactory}, use {@link #closeDefault()}.
+ * {@link ClientFactory} returned by {@link #ofDefault()}, use {@link #closeDefault()}.
  * </p>
  */
 public interface ClientFactory extends Unwrappable, ListenableAsyncCloseable {
@@ -76,7 +79,8 @@ public interface ClientFactory extends Unwrappable, ListenableAsyncCloseable {
      * Returns the default {@link ClientFactory} implementation.
      */
     static ClientFactory ofDefault() {
-        return DefaultClientFactory.DEFAULT;
+        ShutdownHook.ensureRegistered();
+        return Flags.defaultClientFactory();
     }
 
     /**
@@ -84,6 +88,7 @@ public interface ClientFactory extends Unwrappable, ListenableAsyncCloseable {
      * certificate chain.
      */
     static ClientFactory insecure() {
+        ShutdownHook.ensureRegistered();
         return DefaultClientFactory.INSECURE;
     }
 
@@ -100,8 +105,15 @@ public interface ClientFactory extends Unwrappable, ListenableAsyncCloseable {
     static void closeDefault() {
         final Logger logger = LoggerFactory.getLogger(ClientFactory.class);
         logger.debug("Closing the default client factories");
+        final ClientFactory defaultFactory = Flags.defaultClientFactory();
+        final CompletableFuture<?> defaultCloseFuture;
+        if (defaultFactory instanceof DefaultClientFactory) {
+            defaultCloseFuture = ((DefaultClientFactory) defaultFactory).closeAsync(false);
+        } else {
+            defaultCloseFuture = defaultFactory.closeAsync();
+        }
         final CompletableFuture<Void> closeFuture = CompletableFuture.allOf(
-                DefaultClientFactory.DEFAULT.closeAsync(false),
+                defaultCloseFuture,
                 DefaultClientFactory.INSECURE.closeAsync(false)).handle((unused1, cause) -> {
             if (cause == null) {
                 logger.debug("Closed the default client factories");
@@ -135,11 +147,12 @@ public interface ClientFactory extends Unwrappable, ListenableAsyncCloseable {
 
     /**
      * Disables the {@linkplain Runtime#addShutdownHook(Thread) shutdown hook} which closes
-     * {@linkplain #ofDefault() the default <code>ClientFactory</code>}. This method is useful when you need
-     * full control over the life cycle of the default {@link ClientFactory}.
+     * the {@linkplain #ofDefault() default} and {@linkplain #insecure() insecure default}
+     * {@link ClientFactory}s. This method is useful when you need full control over the life cycle
+     * of the default {@link ClientFactory}s.
      */
     static void disableShutdownHook() {
-        DefaultClientFactory.disableShutdownHook0();
+        ShutdownHook.disable();
     }
 
     /**
@@ -389,4 +402,80 @@ public interface ClientFactory extends Unwrappable, ListenableAsyncCloseable {
      * @param whenClosing the {@link Runnable} will be run before closing this {@link ClientFactory}
      */
     CompletableFuture<Void> closeOnJvmShutdown(Runnable whenClosing);
+
+    /**
+     * Registers and manages the shutdown hook for closing the default {@link ClientFactory}s.
+     */
+    final class ShutdownHook {
+        private static volatile boolean disabled;
+
+        static {
+            if (ClientFactory.class.getClassLoader() == ClassLoader.getSystemClassLoader()) {
+                try {
+                    Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+                        if (disabled) {
+                            return;
+                        }
+
+                        closeDefaultIfInitialized();
+                    }));
+                } catch (IllegalStateException e) {
+                    LoggerFactory.getLogger(ClientFactory.class)
+                                 .debug("Skipped adding a shutdown hook to the default ClientFactory.", e);
+                }
+            }
+        }
+
+        private static void closeDefaultIfInitialized() {
+            final Logger logger = LoggerFactory.getLogger(ClientFactory.class);
+            logger.debug("Closing the initialized default client factories");
+            final ClientFactory defaultFactory = Flags.defaultClientFactoryIfInitialized();
+            final CompletableFuture<?> defaultCloseFuture;
+            if (defaultFactory == null) {
+                defaultCloseFuture = UnmodifiableFuture.completedFuture(null);
+            } else if (defaultFactory instanceof DefaultClientFactory) {
+                defaultCloseFuture = ((DefaultClientFactory) defaultFactory).closeAsync(false);
+            } else {
+                defaultCloseFuture = defaultFactory.closeAsync();
+            }
+
+            final CompletableFuture<Void> closeFuture = CompletableFuture.allOf(
+                    defaultCloseFuture,
+                    DefaultClientFactory.INSECURE.closeAsync(false)).handle((unused1, cause) -> {
+                if (cause == null) {
+                    logger.debug("Closed the initialized default client factories");
+                } else {
+                    logger.warn("Failed to close the initialized default client factories:",
+                                Exceptions.peel(cause));
+                }
+                return null;
+            });
+
+            boolean interrupted = false;
+            try {
+                for (;;) {
+                    try {
+                        closeFuture.get();
+                        break;
+                    } catch (InterruptedException e) {
+                        interrupted = true;
+                    } catch (ExecutionException | CancellationException ignored) {
+                        break;
+                    }
+                }
+            } finally {
+                if (interrupted) {
+                    Thread.currentThread().interrupt();
+                }
+            }
+        }
+
+        static void ensureRegistered() {}
+
+        static void disable() {
+            disabled = true;
+        }
+
+        private ShutdownHook() {}
+    }
 }

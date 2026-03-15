@@ -16,6 +16,7 @@
 package com.linecorp.armeria.common;
 
 import static com.google.common.collect.ImmutableSet.toImmutableSet;
+import static java.util.Objects.requireNonNull;
 
 import java.io.IOException;
 import java.net.InetAddress;
@@ -46,6 +47,7 @@ import com.google.common.base.CharMatcher;
 import com.google.common.collect.ImmutableList;
 
 import com.linecorp.armeria.client.ClientBuilder;
+import com.linecorp.armeria.client.ClientFactory;
 import com.linecorp.armeria.client.ClientFactoryBuilder;
 import com.linecorp.armeria.client.ClientTlsSpec;
 import com.linecorp.armeria.client.DnsResolverGroupBuilder;
@@ -217,6 +219,10 @@ public final class Flags {
 
     @Nullable
     private static Boolean dumpOpenSslInfo;
+
+    @Nullable
+    private static volatile ClientFactory defaultClientFactory;
+    private static volatile boolean defaultClientFactoryInitialized;
 
     private static final int MAX_NUM_CONNECTIONS =
             getValue(FlagsProvider::maxNumConnections, "maxNumConnections", value -> value > 0);
@@ -1632,6 +1638,43 @@ public final class Flags {
     @UnstableApi
     public static MeterRegistry meterRegistry() {
         return METER_REGISTRY;
+    }
+
+    /**
+     * Returns the default {@link ClientFactory} resolved from
+     * {@link FlagsProvider#defaultClientFactory()}.
+     *
+     * <p>This value is initialized lazily to avoid initialization cycles while creating the default
+     * {@link ClientFactory}.</p>
+     */
+    @UnstableApi
+    public static ClientFactory defaultClientFactory() {
+        if (defaultClientFactoryInitialized) {
+            return requireNonNull(defaultClientFactory);
+        }
+
+        synchronized (Flags.class) {
+            if (!defaultClientFactoryInitialized) {
+                defaultClientFactory =
+                        getValue(FlagsProvider::defaultClientFactory, "defaultClientFactory");
+                defaultClientFactoryInitialized = true;
+            }
+            return requireNonNull(defaultClientFactory);
+        }
+    }
+
+    /**
+     * Returns the default {@link ClientFactory} if it has already been initialized.
+     *
+     * <p>This method does not trigger initialization of the default {@link ClientFactory}.
+     */
+    @UnstableApi
+    @Nullable
+    public static ClientFactory defaultClientFactoryIfInitialized() {
+        if (!defaultClientFactoryInitialized) {
+            return null;
+        }
+        return defaultClientFactory;
     }
 
     /**

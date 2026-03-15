@@ -144,6 +144,21 @@ class ClientFactoryBuilderTest {
         assertThat(clientFactory.addressResolverGroup()).isInstanceOf(RefreshingAddressResolverGroup.class);
     }
 
+    @Test
+    void shouldRefuseToCloseCurrentDefaultClientFactoryDirectly() {
+        final ClientFactory defaultClientFactory = ClientFactory.ofDefault();
+        assertThat(defaultClientFactory.isClosed()).isFalse();
+
+        defaultClientFactory.close();
+
+        assertThat(defaultClientFactory.isClosed()).isFalse();
+    }
+
+    @Test
+    void shouldReuseBuiltInDefaultClientFactoryForFallback() {
+        assertThat(ClientFactory.ofDefault()).isSameAs(DefaultClientFactory.DEFAULT);
+    }
+
     @ParameterizedTest
     @CsvSource({ "pkcs5.key", "pkcs8.key" })
     void shouldAllowPkcsPrivateKeys(String privateKeyPath) {
